@@ -1,51 +1,140 @@
-Qwen3llada
-==========
+# Qwen3LLada Project Overview
 
-將 Qwen3 架構改為 LLaDA 擴散式遮罩預測（non-causal）推斷/訓練的最小實作，盡量不動原本 Qwen3 的模組：
-- 沿用 Qwen3 的層與權重；僅在 `qwen3llada` 中以非自回歸（去除 causal mask）方式前向。
-- 依據 `llada/GUIDELINES.md` 的 loss 設計，提供 pre-train 與 SFT 兩種訓練 loss。
-- 提供轉換、訓練、推理與分析腳本；整合 HuggingFace datasets。
+This project adapts Qwen3 into a Diffusion-style Language Model (Diffusion LM, DLM) for non‑autoregressive masked‑prediction learning, without making substantial changes to the core Qwen3 architecture. It reuses Qwen3 layers, weights, and the LM head, and performs forward passes with **non‑causal** attention. Training follows LLaDA’s design and incorporates reinforcement strategies from dLLM‑RL to provide a more stable and controllable training/inference pipeline.
 
-目錄：
-- `modeling/qwen3llada/`: HuggingFace 風格的 Qwen3-LLaDA 定義（`Qwen3LLadaForMaskedLM`）。
-- `scripts/train.py`: 訓練迴圈（pretrain/SFT）+ datasets 整合。
-- `scripts/inference.py`: 依 LLaDA 提供的 fixed/semi-autoregressive padding 的取樣流程（含 low-confidence/random remasking）。
-- `scripts/convert.py`: 由 Qwen3 checkpoint 轉為 qwen3llada 權重排列（不改動權重內容）。
-- `scripts/analyze.py`: 對照 Qwen3 與 Qwen3llada 權重鍵值/形狀。
-- `scripts/loss.py`: LLaDA 的 forward_process 與 loss 定義。
-- `config.yaml`: 範例配置。
+## Goals & Design Principles
 
-核心概念：
-- LLaDA = 以 Transformer Encoder（無 causal mask）做 mask token 的同時預測；
-- 訓練：按照 GUIDELINES 的 forward_process 對序列加噪，使用 p_mask 權重交叉熵並以批次長度歸一；SFT 不對 prompt 區加噪、以答案長度歸一；
-- 推理：每步同時預測所有 [MASK]，依策略 remask 一部分（low-confidence/random），支援 block 方式的 semi-autoregressive padding；
-- 權重：直接沿用 Qwen3 的 embedding/層/LM head，僅在前向路徑把 attention mask 設為非因果（None 或自訂 bias）。
+* **Goal:** Implement DLM and LLaDA‑like training/inference on top of the Qwen3 architecture, while adopting dLLM‑RL optimizations (mask scheduling, loss, sampling, etc.) to achieve more stable convergence and more consistent sampling.
+* **Principle:** Keep Qwen3 non‑intrusive; achieve the architectural shift via a thin wrapper plus forward masks (non‑causal/custom additive bias).
+* **Compatibility:** Maintain Hugging Face–style APIs and checkpoint formats (`save_pretrained` / `from_pretrained`).
 
-快速開始：
-1) 轉換權重（可選，訓練可直接從 Qwen3 載入並在記憶體中轉）：
+## Key Features
+
+* **Non‑causal attention + optional Additive Attention Bias**
+
+  * Default non‑causal operation (`attention_mask=None`). Supports user‑provided additive bias with shape `[B, 1, Q, K]` (0 = visible, −inf = masked), enabling “block attention bias during training” and other advanced visibility policies.
+* **Three switchable training losses**
+
+  * **guidelines:** Per the LLaDA paper, apply cross‑entropy (CE) over masked positions with CE/p\_mask and (b\*l) normalization.
+  * **dllm:** Adapted from dLLM‑RL’s LLaDA loss (masked positions determined by `noisy == mask_id`), providing stronger stability.
+  * **soft\_ce:** Masked CE with label smoothing, divided by p\_mask (inspired by dLLM‑RL’s soft‑CE), improving stability.
+  * All CE computations run in **float32** (even when bf16/fp16 is enabled) to avoid numerical instability.
+* **Masking/Noise scheduling (dLLM‑RL style, pretraining)**
+
+  * `schedule`: `uniform` / `cosine` / `power` / `sigmoid`
+  * `noise_type`: `mask` or `random_replace`
+  * `min_masking_rate`: clamps tiny p\_mask values to stabilize 1/p weighting
+  * `mask_contiguous_region_prob`: probability of contiguous span masking
+  * `reweight_cap`: upper bound for 1/p\_mask
+  * Randomly shorten **1%** of sequences (as recommended by LLaDA).
+* **Block attention bias during training (optional)**
+
+  * Consistent with semi‑autoregressive padding sampling: prompt tokens are mutually visible; within the answer region, each block only attends within itself (while still attending to the prompt).
+  * Can be enabled in both training and inference to improve consistency and stability.
+* **Inference (sampling)**
+
+  * `remasking`: `low_confidence` / `random` / `random_topk` (stochastic low‑confidence selection)
+  * **Block generation:** `--block_length` controls chunking; `--block_attention` aligns with the training bias.
+  * Supports **CFG** (classifier‑free guidance).
+* **Optimizers & LR scheduling**
+
+  * Optimizers: `AdamW`, `AdamW8bit`, `Lion8bit` (automatic fallback)
+  * LR: linear / cosine with warmup (via `transformers`).
+* **Checkpoints & resumption**
+
+  * Periodically saves to `{output_dir}/checkpoints/step-{N}` including `model`, `tokenizer`, `optimizer.pt`, and `trainer_state.json` (epoch/global\_step/epoch\_batch).
+  * Resume from `latest` or a specified checkpoint; supports skipping batches within an epoch for true mid‑epoch continuation.
+* **Hugging Face Datasets integration**
+
+  * **Pretraining:** Tokenize from generic text fields (auto‑detected). In non‑streaming mode, sequences are packed to a fixed length.
+  * **SFT:** Supports the HF conversation format (see below) and produces `prompt_lengths`. Training follows the LLaDA SFT loss design.
+
+## Directory Layout & Core Files
+
+* `modeling/qwen3llada/`
+
+  * `configuration_qwen3llada.py`: `Qwen3LLadaConfig` (default `use_cache = False`).
+  * `modeling_qwen3llada.py`: `Qwen3LLadaModel` / `Qwen3LLadaForMaskedLM`; non‑causal attention + additive bias.
+* `scripts/`
+
+  * `train.py`: Training entry point; supports pretraining/SFT, block bias, three loss variants, LR scheduler, checkpoints.
+  * `inference.py`: Inference entry point; supports `block_attention`, `random_topk` remasking, CFG.
+  * `loss.py`: Implementations of `guidelines` / `dllm` / `soft_ce` losses and forward‑time noising.
+  * `convert.py`: Weight mapping Qwen3 → Qwen3LLada (copy without value changes).
+  * `analyze.py`: Key/shape comparison between Qwen3 and Qwen3LLada weights.
+* `config.yaml`: Complete configuration (model, training, datasets, evaluation, optimizer, noise, and block bias).
+
+## SFT Data Format (HF Import)
+
+Supports the following conversation schema (each record needs at least one human→gpt pair):
+
+```json
+[
+  {
+    "conversations": [
+      {"from": "human", "value": "Human instruction"},
+      {"from": "gpt",   "value": "Model answer"}
+    ],
+    "system": "System prompt (optional)"
+  }
+]
 ```
+
+* **Mapping rules:** `BOS + system + human` compose the **prompt**; `gpt` is the **answer**; append `EOS` if present, and record `prompt_lengths`.
+* During SFT training, **no noise** is added to the prompt region; loss is normalized by **answer length** (per the LLaDA SFT design).
+
+## Quick Start
+
+1. **Conversion (optional)**
+
+```bash
 python scripts/convert.py --src demo_model/Qwen3-0.6B-Base --dst out/qwen3llada-converted
 ```
-2) 訓練（預訓練模式）：
-```
+
+2. **Pretraining**
+
+```bash
 python scripts/train.py --config config.yaml
 ```
-3) 推理：
+
+3. **SFT (HF conversation format)**
+
+* In `config.yaml`, set:
+
+  * `training.mode: sft`
+  * `dataset.name: <your HF dataset>` (containing `conversations` / `system`)
+
+```bash
+python scripts/train.py --config config.yaml
 ```
-python scripts/inference.py --model out/qwen3llada-base --prompt "What is diffusion LM?" --steps 128 --gen_length 128 --block_length 32 --remasking random_topk
+
+4. **Inference**
+
+```bash
+python scripts/inference.py \
+  --model out/qwen3llada-base \
+  --prompt "What is diffusion LM?" \
+  --steps 128 --gen_length 128 --block_length 32 \
+  --remasking random_topk --block_attention
 ```
 
-注意事項：
-- `mask_token_id` 預設使用 126336（與 LLaDA 一致）。若 tokenizer 不包含該 token，僅用於張量替換不影響 forward；
-- datasets 預設使用 `wikitext`，實際執行需開網或改成本地資料集；
-- 為維持與 Qwen3 架構一致，未修改原 `modeling/qwen3`；`qwen3llada` 僅包裝並將 attention 調為非因果。注意 diffusion 架構不使用 KV-cache，`Qwen3LLadaConfig` 預設 `use_cache=False`，請勿依賴 cache。
+## Configuration Highlights (`config.yaml`)
 
-訓練時 Block 注意力偏置（可選）：
-- `training.block_attention.enabled: true` 可開啟，並設定 `training.block_attention.block_length`。
-- 行為：prompt tokens 彼此可見；答案區每個 block 僅能互看（仍可看 prompt）。此訓練配置與半自回歸 padding 取樣更一致，有助穩定與一致性。
+* `training.loss_impl`: `guidelines` | `dllm` | `soft_ce`
+* `training.noise`: `schedule` (uniform/cosine/power/sigmoid), `noise_type` (mask/random\_replace), `min_masking_rate`, `mask_contiguous_region_prob`, `reweight_cap`, `random_length_prob`
+* `training.block_attention.enabled`: `true`/`false`; `block_length`: keep consistent with inference
+* `optim.name`: `adamw` | `adamw8bit` | `lion8bit` (auto‑fallback to AdamW)
+* `evaluation.do_eval_loss`: `true` → run eval loss every `eval_every_steps` (same loss path as training)
 
-測試/驗證：
-- `scripts/analyze.py` 可檢查鍵值映射；
-- 可在小型隨機設定上做 forward sanity check（見 `test/`）。
+## Notes
 
-授權：沿用各上游原專案授權條款。
+* Diffusion models do **not** use a KV‑cache; `Qwen3LLadaConfig` defaults to `use_cache = False`.
+* In non‑streaming mode, packing to a fixed length helps stabilize (b\*l) normalization of the loss; packing is **not recommended** for the SFT path.
+* On Windows, `bitsandbytes` may be unavailable; the program automatically falls back.
+* Computing CE in **float32** is more stable (even when bf16/fp16 is enabled).
+
+## Future Extensions
+
+* More advanced masking strategies (two‑stage masking; comp/random hybrids), and toggles that mirror dLLM‑RL’s RL/SFT flows.
+* Layered or alternating block‑attention strategies (SDAR‑like per‑layer planning).
+* Richer sampling policies (dynamic‑threshold unmasking; confidence‑temperature mixing).
