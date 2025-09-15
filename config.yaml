@@ -1,0 +1,71 @@
+# Qwen3llada configuration
+
+project:
+  seed: 42
+  output_dir: out/qwen3llada-base
+  log_dir: log
+  device: cuda  # auto|cuda|cpu
+
+model:
+  # Path to a base Qwen3 checkpoint (local path recommended)
+  base_model_path: demo_model/Qwen3-0.6B-Base
+  # Optional: path to a converted qwen3llada checkpoint; if empty train will convert in-memory
+  qwen3llada_model_path: ''
+  mask_token_id: 126336
+
+training:
+  mode: pretrain  # pretrain|sft
+  loss_impl: soft_ce  # guidelines|dllm|soft_ce
+  loss_smoothing: 0.1
+  epochs: 1
+  max_steps: 40000  # set >0 to limit steps; -1 to disable
+  batch_size: 2
+  micro_batch_size: 2
+  max_length: 1024
+  lr: 2.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.01
+  gradient_accumulation_steps: 4
+  fp16: false
+  bf16: true
+  save_steps: 200
+  save_total_limit: 3
+  resume_from: out/qwen3llada-base/checkpoints/step-1800   # ''|latest|path/to/checkpoint
+  noise:
+    eps: 1.0e-3
+    schedule: cosine   # uniform|cosine
+    random_length_prob: 0.01
+    noise_type: mask    # mask|random_replace (dllm-style option)
+    min_masking_rate: 0.0   # clamp mask prob lower bound before sampling
+    mask_contiguous_region_prob: 0.0  # probability of masking contiguous span instead of scattered tokens
+    reweight_cap: 0.0  # if >0, cap 1/p_mask at this value for stability
+  block_attention:
+    enabled: true
+    block_length: 64
+
+optim:
+  name: adamw        # adamw|adamw8bit|lion8bit
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+
+dataset:
+  # HuggingFace datasets identifier (uses only this dataset)
+  name: beomi/fineweb-edu-fortified-mini
+  config: null
+  split: train
+  text_field: auto  # auto-detects if not provided
+  streaming: false
+  num_proc: 8
+  pack_to_max_length: true  # if false, uses per-example truncation
+
+evaluation:
+  steps: 50
+  do_eval_loss: true
+  eval_every_steps: 200   # compute eval loss every N steps
+  eval_split: "train[:1%]"  # datasets split string for eval loss
+  eval_max_batches: 50
+  max_new_tokens: 128
+  sampling_steps: 64
+  block_length: 32
+  temperature: 0.2
+  remasking: random_topk  # low_confidence|random
