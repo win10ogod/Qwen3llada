@@ -30,7 +30,7 @@ training:
   bf16: true
   save_steps: 200
   save_total_limit: 3
-  resume_from: out/qwen3llada-base/checkpoints/step-1800   # ''|latest|path/to/checkpoint
+  resume_from: ''   # ''|latest|path/to/checkpoint
   noise:
     eps: 1.0e-3
     schedule: cosine   # uniform|cosine
