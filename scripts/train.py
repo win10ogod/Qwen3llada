@@ -485,7 +485,7 @@ def evaluate_loss(model: torch.nn.Module, eval_ds, collate_fn, device: torch.dev
             logits = model(input_ids=noisy_batch, attention_mask=attn_bias).logits
             if cfg.loss_impl == "dllm":
                 from scripts.loss import dllm_llada_pretrain_loss
-                loss = dllm_llada_pretrain_loss(logits, input_ids, noisy_batch, p_mask, cfg.mask_token_id)
+                loss = dllm_llada_pretrain_loss(logits, input_ids, masked_indices, p_mask)
             elif cfg.loss_impl == "soft_ce":
                 from scripts.loss import soft_label_smoothing_loss
                 loss = soft_label_smoothing_loss(logits, input_ids, masked_indices, p_mask, smoothing=cfg.loss_smoothing)
@@ -701,7 +701,7 @@ def main():
                 logits = model(input_ids=noisy_batch, attention_mask=attn_bias).logits
                 if cfg.loss_impl == "dllm":
                     from scripts.loss import dllm_llada_pretrain_loss
-                    loss = dllm_llada_pretrain_loss(logits, input_ids, noisy_batch, p_mask, cfg.mask_token_id)
+                    loss = dllm_llada_pretrain_loss(logits, input_ids, masked_indices, p_mask)
                 elif cfg.loss_impl == "soft_ce":
                     from scripts.loss import soft_label_smoothing_loss
                     loss = soft_label_smoothing_loss(logits, input_ids, masked_indices, p_mask, smoothing=cfg.loss_smoothing)
