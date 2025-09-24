@@ -90,17 +90,20 @@ def soft_label_smoothing_loss(
     return loss_tok.sum() / (input_ids.shape[0] * input_ids.shape[1])
 
 
-def dllm_llada_pretrain_loss(logits: torch.Tensor,
-                             labels: torch.LongTensor,
-                             noisy_input_ids: torch.LongTensor,
-                             p_mask: torch.Tensor,
-                             mask_token_id: int) -> torch.Tensor:
+def dllm_llada_pretrain_loss(
+    logits: torch.Tensor,
+    labels: torch.LongTensor,
+    masked_indices: torch.Tensor,
+    p_mask: torch.Tensor,
+) -> torch.Tensor:
     """Pretrain loss adapted from dLLM-RL-main (llada loss block).
 
-    masked positions are determined by noisy_input_ids == mask_token_id, and
-    CE is reweighted by 1/p_mask and normalized by batch*seq_len.
+    The caller provides the boolean mask of noised positions (e.g. from
+    :func:`forward_process_cfg`), allowing noise types such as random replace
+    where masked tokens are not necessarily equal to ``mask_token_id``. The
+    cross-entropy is reweighted by ``1 / p_mask`` and normalized by
+    ``batch * seq_len``.
     """
-    masked_indices = (noisy_input_ids == mask_token_id)
     logits_f32 = logits.float()
     token_loss = F.cross_entropy(logits_f32[masked_indices], labels[masked_indices], reduction='none') / p_mask[masked_indices]
     loss = token_loss.sum() / (labels.shape[0] * labels.shape[1])
